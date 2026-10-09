@@ -1463,32 +1463,29 @@ __global__ void __launch_bounds__(128) hip_dense_prompt_attn_kernel(
     const int q_idx = blockIdx.x;
     const int kvh = blockIdx.y;
     const int tid = threadIdx.x;
-    const int d0 = tid * 2;
-    const int d1 = d0 + 1;
+    const int d = tid;
 
     const int32_t* step = steps + (size_t) q_idx * kStepCount;
     const int width = __ldg(step + kStepWidth);
     if (width <= 0) return;
 
-    float q_val[12][2];
+    float q_val[12];
 #pragma unroll
     for (int h = 0; h < 12; ++h) {
         if (h < gq) {
             const size_t q_off = ((size_t) q_idx * (size_t)(n_kv_heads * gq) + (size_t)(kvh * gq + h)) * HD;
-            q_val[h][0] = q[q_off + d0] * scale;
-            q_val[h][1] = q[q_off + d1] * scale;
+            q_val[h] = q[q_off + d] * scale;
         }
     }
 
     float m_val[12];
     float l_val[12];
-    float acc[12][2];
+    float acc[12];
 #pragma unroll
     for (int h = 0; h < 12; ++h) {
         m_val[h] = -1e30f;
         l_val[h] = 0.0f;
-        acc[h][0] = 0.0f;
-        acc[h][1] = 0.0f;
+        acc[h] = 0.0f;
     }
 
     __shared__ float red_buf[12][4];
@@ -1500,35 +1497,27 @@ __global__ void __launch_bounds__(128) hip_dense_prompt_attn_kernel(
         if (page < 0) continue;
         const long long row = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
 
-        float k0 = 0.0f, k1 = 0.0f;
+        float k = 0.0f;
         if constexpr (KV_MODE == 0) {
             const uint16_t* kp = p.k_pool + row * HD;
-            k0 = __half2float(*reinterpret_cast<const __half*>(kp + d0));
-            k1 = __half2float(*reinterpret_cast<const __half*>(kp + d1));
+            k = __half2float(*reinterpret_cast<const __half*>(kp + d));
         } else if constexpr (KV_MODE == 1 || KV_MODE == 3) {
             const int8_t* kp = p.k_q + row * HD;
-            const float sc0 = __half2float(__ushort_as_half(__ldg(p.k_scale + row * (HD / KV_Q8_GROUP) + d0 / KV_Q8_GROUP)));
-            const float sc1 = __half2float(__ushort_as_half(__ldg(p.k_scale + row * (HD / KV_Q8_GROUP) + d1 / KV_Q8_GROUP)));
-            k0 = (float) kp[d0] * sc0;
-            k1 = (float) kp[d1] * sc1;
+            const float sc = __half2float(__ushort_as_half(__ldg(p.k_scale + row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP)));
+            k = (float) kp[d] * sc;
         } else if constexpr (KV_MODE == 4) {
             constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
-            const block_q4_0* blk0 = reinterpret_cast<const block_q4_0*>(p.k_q4 + row * BYTES) + (d0 / QK4_0);
-            const block_q4_0* blk1 = reinterpret_cast<const block_q4_0*>(p.k_q4 + row * BYTES) + (d1 / QK4_0);
-            const float dsc0 = __half2float(__ushort_as_half(__ldg(&blk0->d)));
-            const float dsc1 = __half2float(__ushort_as_half(__ldg(&blk1->d)));
-            const int rem0 = d0 % QK4_0;
-            const int rem1 = d1 % QK4_0;
-            const int v0 = (rem0 < 16) ? ((int)(blk0->qs[rem0] & 0x0F) - 8) : ((int)(blk0->qs[rem0 - 16] >> 4) - 8);
-            const int v1 = (rem1 < 16) ? ((int)(blk1->qs[rem1] & 0x0F) - 8) : ((int)(blk1->qs[rem1 - 16] >> 4) - 8);
-            k0 = (float) v0 * dsc0;
-            k1 = (float) v1 * dsc1;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.k_q4 + row * BYTES) + (d / QK4_0);
+            const float dsc = __half2float(__ushort_as_half(__ldg(&blk->d)));
+            const int rem = d % QK4_0;
+            const int v = (rem < 16) ? ((int)(blk->qs[rem] & 0x0F) - 8) : ((int)(blk->qs[rem - 16] >> 4) - 8);
+            k = (float) v * dsc;
         }
 
         float pdot[12];
 #pragma unroll
         for (int h = 0; h < 12; ++h) {
-            pdot[h] = (h < gq) ? (q_val[h][0] * k0 + q_val[h][1] * k1) : 0.0f;
+            pdot[h] = (h < gq) ? (q_val[h] * k) : 0.0f;
         }
 
 #pragma unroll
@@ -1553,29 +1542,21 @@ __global__ void __launch_bounds__(128) hip_dense_prompt_attn_kernel(
             dot[h] = red_buf[h][0] + red_buf[h][1] + red_buf[h][2] + red_buf[h][3];
         }
 
-        float v0 = 0.0f, v1 = 0.0f;
+        float v = 0.0f;
         if constexpr (KV_MODE == 0) {
             const uint16_t* vp = p.v_pool + row * HD;
-            v0 = __half2float(*reinterpret_cast<const __half*>(vp + d0));
-            v1 = __half2float(*reinterpret_cast<const __half*>(vp + d1));
+            v = __half2float(*reinterpret_cast<const __half*>(vp + d));
         } else if constexpr (KV_MODE == 1) {
             const int8_t* vp = p.v_q + row * HD;
-            const float sc0 = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + d0 / KV_Q8_GROUP)));
-            const float sc1 = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + d1 / KV_Q8_GROUP)));
-            v0 = (float) vp[d0] * sc0;
-            v1 = (float) vp[d1] * sc1;
+            const float sc = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP)));
+            v = (float) vp[d] * sc;
         } else if constexpr (KV_MODE == 3 || KV_MODE == 4) {
             constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
-            const block_q4_0* blk0 = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + (d0 / QK4_0);
-            const block_q4_0* blk1 = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + (d1 / QK4_0);
-            const float dsc0 = __half2float(__ushort_as_half(__ldg(&blk0->d)));
-            const float dsc1 = __half2float(__ushort_as_half(__ldg(&blk1->d)));
-            const int rem0 = d0 % QK4_0;
-            const int rem1 = d1 % QK4_0;
-            const int val0 = (rem0 < 16) ? ((int)(blk0->qs[rem0] & 0x0F) - 8) : ((int)(blk0->qs[rem0 - 16] >> 4) - 8);
-            const int val1 = (rem1 < 16) ? ((int)(blk1->qs[rem1] & 0x0F) - 8) : ((int)(blk1->qs[rem1 - 16] >> 4) - 8);
-            v0 = (float) val0 * dsc0;
-            v1 = (float) val1 * dsc1;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + (d / QK4_0);
+            const float dsc = __half2float(__ushort_as_half(__ldg(&blk->d)));
+            const int rem = d % QK4_0;
+            const int val = (rem < 16) ? ((int)(blk->qs[rem] & 0x0F) - 8) : ((int)(blk->qs[rem - 16] >> 4) - 8);
+            v = (float) val * dsc;
         }
 
 #pragma unroll
@@ -1588,8 +1569,7 @@ __global__ void __launch_bounds__(128) hip_dense_prompt_attn_kernel(
                 const float p_weight = expf(s - m_curr);
                 m_val[h] = m_curr;
                 l_val[h] = l_val[h] * a_rescale + p_weight;
-                acc[h][0] = acc[h][0] * a_rescale + p_weight * v0;
-                acc[h][1] = acc[h][1] * a_rescale + p_weight * v1;
+                acc[h] = acc[h] * a_rescale + p_weight * v;
             }
         }
         __syncthreads();
@@ -1600,8 +1580,7 @@ __global__ void __launch_bounds__(128) hip_dense_prompt_attn_kernel(
         if (h < gq) {
             const float inv_l = l_val[h] > 0.0f ? (1.0f / l_val[h]) : 0.0f;
             const size_t out_off = ((size_t) q_idx * (size_t)(n_kv_heads * gq) + (size_t)(kvh * gq + h)) * HD;
-            attn[out_off + d0] = acc[h][0] * inv_l;
-            attn[out_off + d1] = acc[h][1] * inv_l;
+            attn[out_off + d] = acc[h] * inv_l;
         }
     }
 }
