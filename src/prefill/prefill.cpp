@@ -998,7 +998,7 @@ bool Prefill::supports(const core::ModelGeometry& g) {
     // Without an indexer the prompt attention is the tensor-core kernel's dense mode: NVIDIA sm_75+ (elsewhere the
     // prompt is read through the decode windows)
 #if defined(STRATA_USE_HIP)
-    if (!g.has_indexer) return false;
+    // Dense attention prompt path is supported via hip_dense_prompt_attn on HIP
 #else
     if (!g.has_indexer) {
         int dev = 0, major = 0, minor = 0;
@@ -2826,8 +2826,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, idx ? m.sel_ids : nullptr,
                                                                             m.steps_dev, m.cap, s, m.attn, T, m.cs)) {
                         if (!idx) {
-                            err = "prefill: this model's dense prompt attention needs the tensor-core kernel (an NVIDIA "
-                                  "card from RTX 20 on, K/V int8 or fp16)";
+                            err = "prefill: this model's dense prompt attention kernel failed to execute";
                             return false;
                         }
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {

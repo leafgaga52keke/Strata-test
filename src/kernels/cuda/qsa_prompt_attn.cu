@@ -1448,6 +1448,198 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
     }
     return true;
 }
+
+template <int KV_MODE>
+__global__ void __launch_bounds__(128) hip_dense_prompt_attn_kernel(
+    const float* __restrict__ q,
+    QsaAttnPools p,
+    const int32_t* __restrict__ steps,
+    int n_kv_heads,
+    int page_size,
+    float scale,
+    float* __restrict__ attn,
+    int gq
+) {
+    const int q_idx = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int d0 = tid * 2;
+    const int d1 = d0 + 1;
+
+    const int32_t* step = steps + (size_t) q_idx * kStepCount;
+    const int width = __ldg(step + kStepWidth);
+    if (width <= 0) return;
+
+    float q_val[12][2];
+#pragma unroll
+    for (int h = 0; h < 12; ++h) {
+        if (h < gq) {
+            const size_t q_off = ((size_t) q_idx * (size_t)(n_kv_heads * gq) + (size_t)(kvh * gq + h)) * HD;
+            q_val[h][0] = q[q_off + d0] * scale;
+            q_val[h][1] = q[q_off + d1] * scale;
+        }
+    }
+
+    float m_val[12];
+    float l_val[12];
+    float acc[12][2];
+#pragma unroll
+    for (int h = 0; h < 12; ++h) {
+        m_val[h] = -1e30f;
+        l_val[h] = 0.0f;
+        acc[h][0] = 0.0f;
+        acc[h][1] = 0.0f;
+    }
+
+    __shared__ float red_buf[12][4];
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    for (int cell = 0; cell < width; ++cell) {
+        const long long page = (long long) __ldg(p.page_table + cell / page_size);
+        if (page < 0) continue;
+        const long long row = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+
+        float k0 = 0.0f, k1 = 0.0f;
+        if constexpr (KV_MODE == 0) {
+            const uint16_t* kp = p.k_pool + row * HD;
+            k0 = __half2float(*reinterpret_cast<const __half*>(kp + d0));
+            k1 = __half2float(*reinterpret_cast<const __half*>(kp + d1));
+        } else if constexpr (KV_MODE == 1 || KV_MODE == 3) {
+            const int8_t* kp = p.k_q + row * HD;
+            const float sc0 = __half2float(__ushort_as_half(__ldg(p.k_scale + row * (HD / KV_Q8_GROUP) + d0 / KV_Q8_GROUP)));
+            const float sc1 = __half2float(__ushort_as_half(__ldg(p.k_scale + row * (HD / KV_Q8_GROUP) + d1 / KV_Q8_GROUP)));
+            k0 = (float) kp[d0] * sc0;
+            k1 = (float) kp[d1] * sc1;
+        } else if constexpr (KV_MODE == 4) {
+            constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
+            const block_q4_0* blk0 = reinterpret_cast<const block_q4_0*>(p.k_q4 + row * BYTES) + (d0 / QK4_0);
+            const block_q4_0* blk1 = reinterpret_cast<const block_q4_0*>(p.k_q4 + row * BYTES) + (d1 / QK4_0);
+            const float dsc0 = __half2float(__ushort_as_half(__ldg(&blk0->d)));
+            const float dsc1 = __half2float(__ushort_as_half(__ldg(&blk1->d)));
+            const int rem0 = d0 % QK4_0;
+            const int rem1 = d1 % QK4_0;
+            const int v0 = (rem0 < 16) ? ((int)(blk0->qs[rem0] & 0x0F) - 8) : ((int)(blk0->qs[rem0 - 16] >> 4) - 8);
+            const int v1 = (rem1 < 16) ? ((int)(blk1->qs[rem1] & 0x0F) - 8) : ((int)(blk1->qs[rem1 - 16] >> 4) - 8);
+            k0 = (float) v0 * dsc0;
+            k1 = (float) v1 * dsc1;
+        }
+
+        float pdot[12];
+#pragma unroll
+        for (int h = 0; h < 12; ++h) {
+            pdot[h] = (h < gq) ? (q_val[h][0] * k0 + q_val[h][1] * k1) : 0.0f;
+        }
+
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+            for (int h = 0; h < 12; ++h) {
+                pdot[h] += __shfl_xor_sync(0xffffffffu, pdot[h], offset, 32);
+            }
+        }
+
+        if (lane == 0) {
+#pragma unroll
+            for (int h = 0; h < 12; ++h) {
+                red_buf[h][warp] = pdot[h];
+            }
+        }
+        __syncthreads();
+
+        float dot[12];
+#pragma unroll
+        for (int h = 0; h < 12; ++h) {
+            dot[h] = red_buf[h][0] + red_buf[h][1] + red_buf[h][2] + red_buf[h][3];
+        }
+
+        float v0 = 0.0f, v1 = 0.0f;
+        if constexpr (KV_MODE == 0) {
+            const uint16_t* vp = p.v_pool + row * HD;
+            v0 = __half2float(*reinterpret_cast<const __half*>(vp + d0));
+            v1 = __half2float(*reinterpret_cast<const __half*>(vp + d1));
+        } else if constexpr (KV_MODE == 1) {
+            const int8_t* vp = p.v_q + row * HD;
+            const float sc0 = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + d0 / KV_Q8_GROUP)));
+            const float sc1 = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + d1 / KV_Q8_GROUP)));
+            v0 = (float) vp[d0] * sc0;
+            v1 = (float) vp[d1] * sc1;
+        } else if constexpr (KV_MODE == 3 || KV_MODE == 4) {
+            constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
+            const block_q4_0* blk0 = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + (d0 / QK4_0);
+            const block_q4_0* blk1 = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + (d1 / QK4_0);
+            const float dsc0 = __half2float(__ushort_as_half(__ldg(&blk0->d)));
+            const float dsc1 = __half2float(__ushort_as_half(__ldg(&blk1->d)));
+            const int rem0 = d0 % QK4_0;
+            const int rem1 = d1 % QK4_0;
+            const int val0 = (rem0 < 16) ? ((int)(blk0->qs[rem0] & 0x0F) - 8) : ((int)(blk0->qs[rem0 - 16] >> 4) - 8);
+            const int val1 = (rem1 < 16) ? ((int)(blk1->qs[rem1] & 0x0F) - 8) : ((int)(blk1->qs[rem1 - 16] >> 4) - 8);
+            v0 = (float) val0 * dsc0;
+            v1 = (float) val1 * dsc1;
+        }
+
+#pragma unroll
+        for (int h = 0; h < 12; ++h) {
+            if (h < gq) {
+                const float s = dot[h];
+                const float m_prev = m_val[h];
+                const float m_curr = fmaxf(m_prev, s);
+                const float a_rescale = expf(m_prev - m_curr);
+                const float p_weight = expf(s - m_curr);
+                m_val[h] = m_curr;
+                l_val[h] = l_val[h] * a_rescale + p_weight;
+                acc[h][0] = acc[h][0] * a_rescale + p_weight * v0;
+                acc[h][1] = acc[h][1] * a_rescale + p_weight * v1;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int h = 0; h < 12; ++h) {
+        if (h < gq) {
+            const float inv_l = l_val[h] > 0.0f ? (1.0f / l_val[h]) : 0.0f;
+            const size_t out_off = ((size_t) q_idx * (size_t)(n_kv_heads * gq) + (size_t)(kvh * gq + h)) * HD;
+            attn[out_off + d0] = acc[h][0] * inv_l;
+            attn[out_off + d1] = acc[h][1] * inv_l;
+        }
+    }
+}
+
+bool launch_hip_dense_prompt_attn(const float* q, const QsaAttnPools& pools, const int32_t* steps,
+                                  const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    if (n_q <= 0) return true;
+    const int gq = (int)(s.n_head_kv > 0 ? s.n_head / s.n_head_kv : 8);
+    const float scale = 1.0f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        dim3 grid((unsigned) nb, (unsigned) s.n_head_kv);
+        const int threads = 128;
+        const float* q_ptr = q + q0 * s.n_head * HD;
+        const int32_t* steps_ptr = steps + q0 * kStepCount;
+        float* attn_ptr = attn + q0 * s.n_head * HD;
+
+        if (pools.k_q4 != nullptr) {
+            hip_dense_prompt_attn_kernel<4><<<grid, threads, 0, st>>>(
+                q_ptr, pools, steps_ptr, (int) s.n_head_kv, (int) s.page_size, scale, attn_ptr, gq);
+        } else if (pools.k_q != nullptr && pools.v_q4 != nullptr) {
+            hip_dense_prompt_attn_kernel<3><<<grid, threads, 0, st>>>(
+                q_ptr, pools, steps_ptr, (int) s.n_head_kv, (int) s.page_size, scale, attn_ptr, gq);
+        } else if (pools.k_q != nullptr) {
+            hip_dense_prompt_attn_kernel<1><<<grid, threads, 0, st>>>(
+                q_ptr, pools, steps_ptr, (int) s.n_head_kv, (int) s.page_size, scale, attn_ptr, gq);
+        } else {
+            hip_dense_prompt_attn_kernel<0><<<grid, threads, 0, st>>>(
+                q_ptr, pools, steps_ptr, (int) s.n_head_kv, (int) s.page_size, scale, attn_ptr, gq);
+        }
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (hip_dense): %s\n", cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
 #endif
 
 }  // namespace
@@ -1522,6 +1714,8 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable())
         return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    if (ids == nullptr && steps != nullptr && pools.page_table != nullptr && s.head_dim == HD)
+        return launch_hip_dense_prompt_attn(q, pools, steps, s, attn, n_q, (cudaStream_t) stream);
     return false;
 #endif
     // query heads per KV head: 12 (Flash-Next) or 8 (Qwen3.6); ids null = dense (every cell of the width, which
