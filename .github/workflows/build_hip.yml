@@ -1,0 +1,27 @@
+name: Build Windows HIP
+
+on:
+  workflow_dispatch:   # 允许在网页上手动点击按钮触发
+
+jobs:
+  build:
+    runs-on: windows-latest   # 使用微软云端自带 VS2022 的 Windows 服务器
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build HIP Engine
+        shell: cmd
+        run: |
+          set STRATA_HIP_ARCHS=gfx1031
+          call tools\hip\build_windows.bat
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-windows-x64-hip-qwen36
+          path: dist/strata-windows-x64-hip.zip
