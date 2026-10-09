@@ -669,7 +669,7 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #endif
 // Unsloth's Qwen3.6 UD files (n_ff 512 = two superblocks per row): Q6_K (the few layers kept at 6 bits), IQ3_XXS
 // (UD-IQ2_M), Q5_K (UD-Q4_K_XL), and their MTP layers' Q3_K / Q4_K / Q5_K (with Q2_K / Q3_K gate/up above)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(14) X(12) X(13) X(18) X(11)
+#define STRATA_D_FMTS(X) X(20) X(22) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(14) X(12) X(13) X(18) X(11)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(11) X(10)
 
 __device__ __forceinline__ float warp_sum(float v) {

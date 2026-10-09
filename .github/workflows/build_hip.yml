@@ -2,6 +2,8 @@ name: Build Windows HIP
 
 on:
   workflow_dispatch:   # 允许在网页上手动点击按钮触发
+  push:
+    branches: [ qwen36 ]
 
 jobs:
   build:
