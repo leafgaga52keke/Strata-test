@@ -626,6 +626,34 @@ template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_K_q8_1(v, y, kbx, iqs); } };
+// Q3_K (the gate/up/down of Qwen3.6 MTP and APEX-MINI): llama.cpp's vec_dot_q3_K_q8_1 (vecdotq.cuh, VDR 1), transcribed
+constexpr int VDR_Q3_K = 1;
+__device__ __forceinline__ float vec_dot_q3_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q3_K* bq3_K = (const block_q3_K*) vbq + kbx;
+    const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const float d3 = __half2float(bq3_K->d);
+    const int vl = get_int_b2(bq3_K->qs, iqs);
+    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K / 2)) >> bq8_offset;   // a 0/1 bit subtracts 4/0
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int u = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        const float d8 = __low2float(bq8_1[bq8_offset + i].ds);
+        const int isc = scale_offset + 2 * i;
+        const int sc_low = (bq3_K->scales[isc % (QK_K / 32)] >> (4 * (isc / (QK_K / 32)))) & 0xF;
+        const int sc_high = ((bq3_K->scales[(QK_K / 32) + isc % (QK_K / 64)] >> (2 * (isc / (QK_K / 64)))) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        const int vi = __vsubss4(vil, vih);
+        sumf += d8 * (ggml_cuda_dp4a(vi, u, 0) * sc);
+    }
+    return d3 * sumf;
+}
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K / VDR_Q3_K, step = VDR_Q3_K;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<14> { static constexpr int qk = 256, ipb = QI6_K / VDR_Q6_K, step = VDR_Q6_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q6_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<7> { static constexpr int qk = 32, ipb = QI5_1 / VDR_Q5_1, step = VDR_Q5_1;
@@ -642,17 +670,17 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(11) X(40)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(11) X(40)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40)
+#define STRATA_D_FMTS(X) X(20) X(22) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(11) X(40)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40)
+#define STRATA_D_FMTS(X) X(20) X(22) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(11) X(40)
 #endif
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(11) X(40)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
